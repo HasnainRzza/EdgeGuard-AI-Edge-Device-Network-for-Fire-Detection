@@ -46,8 +46,9 @@ The complete system covers every phase of a production MLOps lifecycle:
 - Configurable training with full per-epoch MLflow tracking
 - Statistical performance analysis comparing the trained model against baseline architectures
 - INT8 quantisation for embedded deployment
-- A FastAPI inference server with built-in Prometheus instrumentation
-- A pre-provisioned Grafana dashboard that displays both model metrics and live API metrics without any manual setup
+- A FastAPI inference server with built-in Prometheus instrumentation and asynchronous request logging
+- Active Data Drift handling via a low-confidence feedback loop, automatic data augmentation, and targeted model finetuning
+- A pre-provisioned Grafana dashboard with configured visual and Prometheus-level alerts for model decay and API errors
 
 ---
 
@@ -266,6 +267,11 @@ mlflow:
 
 monitoring:
   pushgateway_url: "localhost:9091"
+
+logging:
+  batch_size: 20
+  time_limit_sec: 5.0
+  log_file: "logs/api_requests.jsonl"
 ```
 
 **Width multiplier (`alpha`)** is the most impactful setting. It scales the number of filters in every convolutional layer by the given factor:
@@ -477,6 +483,36 @@ curl -X POST "http://localhost:8000/infer" \
 
 If no model has been trained yet, the endpoint returns HTTP 503 Service Unavailable.
 
+**Note on Data Drift:** If the model's confidence is below 80%, the response will include `"needs_feedback": true` and a `"feedback_id"`. This image's preprocessed matrix is cached in memory for 5 minutes. You can submit the true label to the `/feedback` endpoint to store this data for future finetuning.
+
+---
+
+### POST /feedback
+
+Accepts ground-truth labels for low-confidence inferences, automatically applies augmentation, and saves the features locally as `.npy` matrices to prevent data drift without storing raw images.
+
+**Request Body (JSON):**
+```json
+{
+  "feedback_id": "uuid-string-from-infer",
+  "label": "fire"
+}
+```
+
+---
+
+### POST /finetune
+
+Triggers an isolated background training job that finetunes the currently loaded model exclusively on the drift features collected via the `/feedback` endpoint.
+
+**Response:**
+```json
+{
+  "message": "Finetuning started in the background.",
+  "status_endpoint": "/pipeline/status"
+}
+```
+
 ---
 
 ### POST /retrain
@@ -583,7 +619,18 @@ The dashboard contains the following panels:
 | Inference Operations | Time series | Volume of /infer calls over time |
 | Inference Latency | Time series | Model-only computation time per inference call |
 
-All panels query Prometheus and refresh automatically every 5 seconds.
+All panels query Prometheus and refresh automatically every 5 seconds. Visual color thresholds (green/orange/red) are embedded directly into panels to instantly flag degraded performance or high latency.
+
+### System Alerts
+
+System-level alert rules are defined in `monitoring/alert.rules` and natively integrated with Grafana's alerting engine. They include:
+- **`ModelAccuracyDrop`**: Critical alert when accuracy falls below 80% (triggering the need for `/finetune`).
+- **`HighInferenceLatency`**: Warning alert if average inference latency exceeds 1.0 second.
+- **`HighAPIErrorRate`**: Critical alert if 5xx server errors spike.
+
+### Asynchronous Request Logging
+
+All API requests are logged via a non-blocking asynchronous batch logger. To ensure zero performance overhead on the inference endpoints, logs are queued in memory and flushed to disk (`logs/api_requests.jsonl`) by a background worker either when the batch size is reached (e.g. 20 requests) or the time limit expires (e.g. 5 seconds).
 
 ---
 

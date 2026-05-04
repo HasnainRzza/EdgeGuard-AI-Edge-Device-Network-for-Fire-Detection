@@ -15,3 +15,8 @@ mlflow:
 
 monitoring:
   pushgateway_url: "localhost:9091"
+
+logging:
+  batch_size: 20
+  time_limit_sec: 5
+  log_file: "logs/api_requests.jsonl"

@@ -225,3 +225,7 @@ fire_dataset/non_fire_images/*
 # BUT keep folder structure
 !fire_dataset/fire_images/.gitkeep
 !fire_dataset/non_fire_images/.gitkeep
+
+# Ignore monitoring persistence data
+monitoring/prometheus_data/
+monitoring/grafana_data/

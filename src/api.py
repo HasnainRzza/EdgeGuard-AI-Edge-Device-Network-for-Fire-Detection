@@ -12,6 +12,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import uuid
 
 from prometheus_client import (
     Counter, Histogram, Gauge, CollectorRegistry,
@@ -28,11 +30,20 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from utils import load_config, get_project_root
+from async_logger import AsyncBatchLogger
+from drift_handler import save_feedback_features, run_finetuning
 
 config = load_config()
 IMG_SIZE   = config['training']['img_size']
 CLASSES    = config['training']['classes']
 MODEL_PATH = os.path.join(get_project_root(), "models", "fire_model.keras")
+
+log_config = config.get("logging", {})
+api_logger = AsyncBatchLogger(
+    batch_size=log_config.get("batch_size", 20),
+    time_limit_sec=log_config.get("time_limit_sec", 5.0),
+    log_file=os.path.join(get_project_root(), log_config.get("log_file", "logs/api_requests.jsonl"))
+)
 
 # ─────────────────────────────────────────────
 # Prometheus metrics
@@ -83,6 +94,15 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
             endpoint=endpoint,
             status_code=response.status_code
         ).inc()
+
+        # Log request asynchronously
+        await api_logger.log({
+            "method": request.method,
+            "endpoint": endpoint,
+            "status_code": response.status_code,
+            "latency_ms": round(duration * 1000, 3)
+        })
+
         return response
 
 
@@ -92,6 +112,10 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
 model_store: dict = {"model": None}
 pipeline_state: dict = {"running": False, "status": "idle", "message": ""}
 executor = ThreadPoolExecutor(max_workers=2)
+
+pending_feedback = {}
+FEEDBACK_TTL = 300 # 5 minutes
+
 
 
 def load_model_into_store():
@@ -105,7 +129,9 @@ def load_model_into_store():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_model_into_store()
+    api_logger.start()
     yield
+    await api_logger.stop()
 
 
 # ─────────────────────────────────────────────
@@ -297,13 +323,27 @@ async def infer(file: UploadFile = File(...)):
     confidence  = float(preds[0][class_idx])
     class_label = CLASSES[class_idx]
 
-    return {
+    response_data = {
         "prediction":   class_label,
         "confidence":   round(confidence * 100, 2),
         "all_scores":   {c: round(float(s) * 100, 2) for c, s in zip(CLASSES, preds[0])},
         "latency_ms":   round(latency * 1000, 3),
         "image_resized_to": f"{IMG_SIZE}x{IMG_SIZE}",
     }
+
+    if confidence < 0.80:
+        feedback_id = str(uuid.uuid4())
+        # Clean up old entries
+        now = time.time()
+        keys_to_delete = [k for k, v in pending_feedback.items() if now - v[0] > FEEDBACK_TTL]
+        for k in keys_to_delete:
+            del pending_feedback[k]
+            
+        pending_feedback[feedback_id] = (now, img)
+        response_data["needs_feedback"] = True
+        response_data["feedback_id"] = feedback_id
+
+    return response_data
 
 
 # ── 3. Retrain ────────────────────────────────
@@ -415,6 +455,62 @@ async def retrain(background_tasks: BackgroundTasks, dataset_dir: str = None):
             "Retraining may take several minutes. "
             "Poll /pipeline/status for live updates."
         )
+    }
+
+class FeedbackRequest(BaseModel):
+    feedback_id: str
+    label: str
+
+@app.post("/feedback", tags=["Inference"])
+async def feedback(req: FeedbackRequest):
+    """Accepts user feedback for low-confidence inferences, and stores augmented features."""
+    if req.feedback_id not in pending_feedback:
+        raise HTTPException(404, "Feedback ID not found or expired")
+        
+    timestamp, img_array = pending_feedback.pop(req.feedback_id)
+    if time.time() - timestamp > FEEDBACK_TTL:
+        raise HTTPException(404, "Feedback ID expired")
+        
+    if req.label not in CLASSES:
+        raise HTTPException(400, f"Label must be one of {CLASSES}")
+        
+    save_feedback_features(req.feedback_id, req.label, img_array)
+    return {"message": f"Feedback received. Augmented features saved for {req.label}."}
+
+@app.post("/finetune", tags=["Pipeline"])
+async def finetune(background_tasks: BackgroundTasks):
+    """Starts finetuning the existing model using recently collected drift features."""
+    if pipeline_state["running"]:
+        raise HTTPException(status_code=409, detail="A pipeline run is already in progress.")
+        
+    if model_store["model"] is None:
+        raise HTTPException(status_code=503, detail="No trained model found to finetune.")
+
+    def _task():
+        pipeline_state["running"] = True
+        pipeline_state["status"]  = "finetuning"
+        pipeline_state["message"] = "Finetuning on drift features..."
+        TRAINING_STATUS.set(1)
+        try:
+            # We use the loaded model
+            run_finetuning(model_store["model"])
+            load_model_into_store()
+            pipeline_state["status"]  = "completed"
+            pipeline_state["message"] = "Finetuning finished successfully."
+        except Exception as exc:
+            pipeline_state["status"]  = "failed"
+            pipeline_state["message"] = str(exc)
+            traceback.print_exc()
+        finally:
+            pipeline_state["running"] = False
+            TRAINING_STATUS.set(0)
+            push_metrics()
+
+    background_tasks.add_task(_task)
+    
+    return {
+        "message": "Finetuning started in the background.",
+        "status_endpoint": "/pipeline/status"
     }
 
 

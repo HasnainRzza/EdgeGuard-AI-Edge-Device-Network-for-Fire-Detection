@@ -1,0 +1,29 @@
+groups:
+- name: EdgeGuardAlerts
+  rules:
+  - alert: HighInferenceLatency
+    expr: rate(inference_latency_seconds_sum[1m]) / rate(inference_latency_seconds_count[1m]) > 1.0
+    for: 1m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High Inference Latency"
+      description: "Inference latency is taking more than 1 second on average."
+
+  - alert: ModelAccuracyDrop
+    expr: model_accuracy < 0.8
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Model Accuracy Drop Detected"
+      description: "Model accuracy has dropped below 80%. Retraining might be required."
+
+  - alert: HighAPIErrorRate
+    expr: sum(rate(api_requests_total{status_code=~"5.."}[1m])) > 0.5
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "High API Error Rate"
+      description: "The API is experiencing a high rate of 5xx server errors."
